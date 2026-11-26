@@ -403,6 +403,15 @@ pub trait WorldStorage: Send + Sync {
     fn compact(&self) -> Result<()> {
         self.flush()
     }
+    /// Same as [`WorldStorage::compact`], with an explicit native table block
+    /// target and zlib effort for backends that write tables.
+    ///
+    /// Larger blocks capture redundancy between neighbouring records, which
+    /// matters for NBT-heavy worlds, at the cost of decompressing more per point
+    /// read. Backends that rewrite nothing ignore both values.
+    fn compact_with(&self, _block_size: usize, _zlib_level: u32) -> Result<()> {
+        self.compact()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1052,6 +1061,12 @@ pub mod backend {
         fn compact(&self) -> Result<()> {
             self.db
                 .compact_range_native(None, None)
+                .map_err(map_leveldb_error)
+        }
+
+        fn compact_with(&self, block_size: usize, zlib_level: u32) -> Result<()> {
+            self.db
+                .compact_range_with(None, None, block_size, zlib_level)
                 .map_err(map_leveldb_error)
         }
     }

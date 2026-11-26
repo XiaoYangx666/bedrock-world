@@ -1198,6 +1198,17 @@ where
         self.storage().compact()
     }
 
+    /// Compact with an explicit native table block target and zlib effort.
+    ///
+    /// `block_size` is the uncompressed target for one table block; `zlib_level`
+    /// is `0..=9`. BDS writes with a much larger effective block size than the
+    /// 4 KiB default, so rewrites of its worlds usually need both to avoid
+    /// growing the database.
+    pub fn compact_storage_blocking_with(&self, block_size: usize, zlib_level: u32) -> Result<()> {
+        self.ensure_writable()?;
+        self.storage().compact_with(block_size, zlib_level)
+    }
+
     /// List players blocking.
     pub fn list_players_blocking(&self) -> Result<Vec<PlayerId>> {
         let mut players = Vec::new();

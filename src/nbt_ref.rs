@@ -44,7 +44,13 @@ fn parse_payload<'a>(input: &mut &'a [u8], tag_type: u8, depth: usize) -> Result
         TAG_FLOAT => Ok(NbtRef::Float(f32::from_le_bytes(take_array(input)?))),
         TAG_DOUBLE => Ok(NbtRef::Double(f64::from_le_bytes(take_array(input)?))),
         TAG_BYTE_ARRAY => parse_byte_array(input),
-        TAG_STRING => Ok(NbtRef::String(Cow::Borrowed(take_string(input)?))),
+        TAG_STRING => {
+            let bytes = take_string_bytes(input)?;
+            Ok(match std::str::from_utf8(bytes) {
+                Ok(value) => NbtRef::String(Cow::Borrowed(value)),
+                Err(_) => NbtRef::StringRaw(bytes),
+            })
+        }
         TAG_LIST => parse_list(input, depth),
         TAG_COMPOUND => parse_compound(input, depth),
         TAG_INT_ARRAY => parse_i32_array(input),
@@ -108,8 +114,13 @@ fn parse_i64_array<'a>(input: &mut &'a [u8]) -> Result<NbtRef<'a>> {
 }
 
 fn take_string<'a>(input: &mut &'a [u8]) -> Result<&'a str> {
+    let bytes = take_string_bytes(input)?;
+    std::str::from_utf8(bytes).map_err(|error| nbt_error(&error.to_string()))
+}
+
+fn take_string_bytes<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
     let len = usize::from(u16::from_le_bytes(take_array(input)?));
-    std::str::from_utf8(take(input, len)?).map_err(|error| nbt_error(&error.to_string()))
+    take(input, len)
 }
 
 fn take_len(input: &mut &[u8], name: &str) -> Result<usize> {

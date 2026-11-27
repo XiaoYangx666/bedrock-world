@@ -52,6 +52,13 @@ pub enum NbtTag {
     ByteArray(Vec<i8>),
     /// UTF-8 string.
     String(String),
+    /// `TAG_STRING` whose payload is not valid UTF-8.
+    ///
+    /// Bedrock writes some binary fields this way; `internalComponents`'
+    /// `EntityStorageKeyComponent.StorageKey` holds a raw 8-byte storage key.
+    /// The bytes are preserved verbatim so parsed records can be written back
+    /// without corrupting those fields.
+    StringRaw(Vec<u8>),
     /// Homogeneous list.
     List(Vec<NbtTag>),
     /// Named tag map preserving source order.
@@ -88,6 +95,8 @@ pub enum NbtRef<'a> {
     ByteArray(Cow<'a, [i8]>),
     /// String variant.
     String(Cow<'a, str>),
+    /// `TAG_STRING` payload that is not valid UTF-8, kept as raw bytes.
+    StringRaw(&'a [u8]),
     /// List variant.
     List(Vec<NbtRef<'a>>),
     /// Compound variant.
@@ -114,6 +123,7 @@ impl NbtRef<'_> {
             Self::Double(value) => NbtTag::Double(*value),
             Self::ByteArray(values) => NbtTag::ByteArray(values.to_vec()),
             Self::String(value) => NbtTag::String(value.to_string()),
+            Self::StringRaw(bytes) => NbtTag::StringRaw(bytes.to_vec()),
             Self::List(values) => NbtTag::List(values.iter().map(Self::to_owned_tag).collect()),
             Self::Compound(values) => NbtTag::Compound(
                 values
@@ -257,6 +267,13 @@ pub enum NbtEvent<'a> {
         /// Parsed or raw value associated with this record.
         value: &'a str,
     },
+    /// `TAG_STRING` payload that is not valid UTF-8.
+    StringRaw {
+        /// Named Bedrock value or identifier.
+        name: Option<&'a str>,
+        /// Raw payload bytes preserved verbatim.
+        bytes: &'a [u8],
+    },
     /// Byte array variant.
     ByteArray {
         /// Named Bedrock value or identifier.
@@ -384,7 +401,7 @@ fn parse_tag_payload(reader: &mut impl Read, tag_type: u8, depth: usize) -> Resu
             }
             Ok(NbtTag::ByteArray(values))
         }
-        TAG_STRING => Ok(NbtTag::String(read_string(reader)?)),
+        TAG_STRING => Ok(decode_string_tag(read_string_bytes(reader)?)),
         TAG_LIST => {
             let element_type = read_u8(reader)?;
             let len = read_container_length(reader, "List")?;
@@ -467,6 +484,7 @@ fn serialize_tag_payload(writer: &mut impl Write, tag: &NbtTag) -> Result<()> {
             Ok(())
         }
         NbtTag::String(value) => write_string(writer, value),
+        NbtTag::StringRaw(bytes) => write_raw_string(writer, bytes),
         NbtTag::List(values) => {
             let element_type = values.first().map_or(TAG_END, tag_discriminant);
             writer.write_all(&[element_type])?;
@@ -522,6 +540,7 @@ fn validate_nbt_tag_for_write(tag: &NbtTag, depth: usize, path: &str) -> Result<
         | NbtTag::Float(_)
         | NbtTag::Double(_) => Ok(()),
         NbtTag::String(value) => validate_string(value, path),
+        NbtTag::StringRaw(bytes) => validate_raw_string(bytes, path),
         NbtTag::ByteArray(values) => validate_array_len(values.len(), path),
         NbtTag::IntArray(values) => validate_array_len(values.len(), path),
         NbtTag::LongArray(values) => validate_array_len(values.len(), path),
@@ -570,6 +589,9 @@ pub fn nbt_tags_equal_for_write(left: &NbtTag, right: &NbtTag) -> bool {
         (NbtTag::Double(left), NbtTag::Double(right)) => left.to_bits() == right.to_bits(),
         (NbtTag::ByteArray(left), NbtTag::ByteArray(right)) => left == right,
         (NbtTag::String(left), NbtTag::String(right)) => left == right,
+        (NbtTag::StringRaw(left), NbtTag::StringRaw(right)) => left == right,
+        (NbtTag::String(left), NbtTag::StringRaw(right))
+        | (NbtTag::StringRaw(right), NbtTag::String(left)) => left.as_bytes() == right,
         (NbtTag::List(left), NbtTag::List(right)) => {
             left.len() == right.len()
                 && left
@@ -594,6 +616,15 @@ pub fn nbt_tags_equal_for_write(left: &NbtTag, right: &NbtTag) -> bool {
 
 fn validate_string(value: &str, path: &str) -> Result<()> {
     if value.len() > MAX_NBT_STRING_BYTES {
+        return Err(BedrockWorldError::Validation(format!(
+            "NBT string is too long at {path}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_raw_string(bytes: &[u8], path: &str) -> Result<()> {
+    if bytes.len() > MAX_NBT_STRING_BYTES {
         return Err(BedrockWorldError::Validation(format!(
             "NBT string is too long at {path}"
         )));
@@ -634,7 +665,7 @@ fn tag_discriminant(tag: &NbtTag) -> u8 {
         NbtTag::Float(_) => TAG_FLOAT,
         NbtTag::Double(_) => TAG_DOUBLE,
         NbtTag::ByteArray(_) => TAG_BYTE_ARRAY,
-        NbtTag::String(_) => TAG_STRING,
+        NbtTag::String(_) | NbtTag::StringRaw(_) => TAG_STRING,
         NbtTag::List(_) => TAG_LIST,
         NbtTag::Compound(_) => TAG_COMPOUND,
         NbtTag::IntArray(_) => TAG_INT_ARRAY,
@@ -710,18 +741,39 @@ fn read_f64(reader: &mut impl Read) -> Result<f64> {
 }
 
 fn read_string(reader: &mut impl Read) -> Result<String> {
+    let bytes = read_string_bytes(reader)?;
+    Ok(String::from_utf8(bytes)?)
+}
+
+fn read_string_bytes(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut len = [0; 2];
     reader.read_exact(&mut len)?;
     let len = u16::from_le_bytes(len) as usize;
     let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes)?;
-    Ok(String::from_utf8(bytes)?)
+    Ok(bytes)
+}
+
+/// Keeps non UTF-8 `TAG_STRING` payloads verbatim instead of rejecting them.
+fn decode_string_tag(bytes: Vec<u8>) -> NbtTag {
+    match String::from_utf8(bytes) {
+        Ok(value) => NbtTag::String(value),
+        Err(error) => NbtTag::StringRaw(error.into_bytes()),
+    }
 }
 
 fn write_string(writer: &mut impl Write, value: &str) -> Result<()> {
     validate_string(value, "<string>")?;
     writer.write_all(&(value.len() as u16).to_le_bytes())?;
     writer.write_all(value.as_bytes())?;
+    Ok(())
+}
+
+fn write_raw_string(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    let len = u16::try_from(bytes.len())
+        .map_err(|_| BedrockWorldError::Validation("NBT string exceeds 65535 bytes".to_string()))?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(bytes)?;
     Ok(())
 }
 
@@ -830,10 +882,13 @@ where
                 bytes: reader.take(len)?,
             });
         }
-        TAG_STRING => emit!(NbtEvent::String {
-            name,
-            value: reader.read_string_ref()?,
-        }),
+        TAG_STRING => {
+            let bytes = reader.read_string_bytes_ref()?;
+            match std::str::from_utf8(bytes) {
+                Ok(value) => emit!(NbtEvent::String { name, value }),
+                Err(_) => emit!(NbtEvent::StringRaw { name, bytes }),
+            }
+        }
         TAG_LIST => return visit_list_events(reader, name, depth, visitor),
         TAG_COMPOUND => return visit_compound_events(reader, name, depth, visitor),
         TAG_INT_ARRAY => {
@@ -991,13 +1046,17 @@ impl<'a> SliceNbtReader<'a> {
     }
 
     fn read_string_ref(&mut self) -> Result<&'a str> {
+        let bytes = self.read_string_bytes_ref()?;
+        Ok(std::str::from_utf8(bytes)?)
+    }
+
+    fn read_string_bytes_ref(&mut self) -> Result<&'a [u8]> {
         let len_bytes: [u8; 2] = self
             .take(2)?
             .try_into()
             .map_err(|_| BedrockWorldError::Nbt("NBT string length is truncated".to_string()))?;
         let len = u16::from_le_bytes(len_bytes) as usize;
-        let bytes = self.take(len)?;
-        Ok(std::str::from_utf8(bytes)?)
+        self.take(len)
     }
 
     fn read_container_length(&mut self, name: &str) -> Result<usize> {
@@ -1050,6 +1109,85 @@ mod tests {
         let parsed = parse_root_nbt(&bytes).expect("parse");
 
         assert!(nbt_tags_equal_for_write(&tag, &parsed));
+    }
+
+    #[test]
+    fn non_utf8_string_payloads_roundtrip_verbatim() {
+        // `internalComponents…StorageKey` is a TAG_String holding a raw i64.
+        let storage_key = vec![0x00, 0x00, 0x00, 0xfa, 0x00, 0x00, 0x17, 0xbb];
+        let mut components = IndexMap::new();
+        components.insert(
+            "EntityStorageKeyComponent".to_string(),
+            NbtTag::Compound(IndexMap::from([(
+                "StorageKey".to_string(),
+                NbtTag::StringRaw(storage_key.clone()),
+            )])),
+        );
+        let mut root = IndexMap::new();
+        root.insert(
+            "internalComponents".to_string(),
+            NbtTag::Compound(components),
+        );
+        let tag = NbtTag::Compound(root);
+
+        let bytes = serialize_root_nbt(&tag).expect("serialize");
+        let parsed = parse_root_nbt(&bytes).expect("parse");
+
+        assert_eq!(parsed, tag);
+        assert!(nbt_tags_equal_for_write(&tag, &parsed));
+        assert_eq!(serialize_root_nbt(&parsed).expect("reserialize"), bytes);
+
+        let NbtTag::Compound(root) = &parsed else {
+            panic!("expected compound root");
+        };
+        let Some(NbtTag::Compound(components)) = root.get("internalComponents") else {
+            panic!("expected internalComponents compound");
+        };
+        assert_eq!(
+            components.get("EntityStorageKeyComponent"),
+            Some(&NbtTag::Compound(IndexMap::from([(
+                "StorageKey".to_string(),
+                NbtTag::StringRaw(storage_key.clone()),
+            )])))
+        );
+    }
+
+    #[test]
+    fn valid_utf8_string_payloads_stay_owned_strings() {
+        let bytes = serialize_root_nbt(&NbtTag::Compound(IndexMap::from([(
+            "Name".to_string(),
+            NbtTag::String("石头".to_string()),
+        )])))
+        .expect("serialize");
+
+        let parsed = parse_root_nbt(&bytes).expect("parse");
+        let NbtTag::Compound(root) = &parsed else {
+            panic!("expected compound root");
+        };
+        assert_eq!(root.get("Name"), Some(&NbtTag::String("石头".to_string())));
+    }
+
+    #[test]
+    fn raw_string_views_and_events_preserve_bytes() {
+        let raw = vec![0xff, 0x00, 0x80];
+        let tag = NbtTag::Compound(IndexMap::from([(
+            "Key".to_string(),
+            NbtTag::StringRaw(raw.clone()),
+        )]));
+        let bytes = serialize_root_nbt(&tag).expect("serialize");
+
+        let events = NbtReader::new(&bytes).view().events().expect("events");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NbtEvent::StringRaw { name: Some("Key"), bytes } if *bytes == raw.as_slice()
+        )));
+
+        let view = NbtReader::new(&bytes).parse_root_ref().expect("root ref");
+        let NbtRef::Compound(entries) = view else {
+            panic!("expected compound");
+        };
+        assert!(entries.iter().any(|(key, value)| key == "Key"
+            && matches!(value, NbtRef::StringRaw(bytes) if *bytes == raw.as_slice())));
     }
 
     #[test]

@@ -614,10 +614,10 @@ impl BedrockDbKey {
         if let Some(village) = parse_village_key(key) {
             return Self::Village(village);
         }
-        if let Some(name) = ascii_suffix(key, b"structuretemplate") {
+        if let Some(name) = utf8_suffix(key, b"structuretemplate") {
             return Self::StructureTemplate(name);
         }
-        if let Some(name) = ascii_suffix(key, b"tickingarea") {
+        if let Some(name) = utf8_suffix(key, b"tickingarea") {
             return Self::TickingArea(name);
         }
         if key == b"game_flatworldlayers" {
@@ -2062,6 +2062,23 @@ fn ascii_suffix(key: &[u8], prefix: &[u8]) -> Option<String> {
     None
 }
 
+/// Accepts any valid UTF-8 suffix without control characters.
+///
+/// Template and ticking-area names are user supplied and routinely non-ASCII
+/// (e.g. `structuretemplate_mystructure:石头遗…`), so they must not be held to
+/// the ASCII-only rule used for machine-generated keys.
+fn utf8_suffix(key: &[u8], prefix: &[u8]) -> Option<String> {
+    let suffix = key.strip_prefix(prefix)?;
+    if suffix.is_empty() {
+        return None;
+    }
+    let text = std::str::from_utf8(suffix).ok()?;
+    if text.chars().any(char::is_control) {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
 fn parse_village_key(key: &[u8]) -> Option<ParsedVillageKey> {
     let raw = std::str::from_utf8(key).ok()?;
     let parts = raw.split('_').collect::<Vec<_>>();
@@ -2142,6 +2159,41 @@ mod tests {
             BedrockDbKeyKind::classify(b"unclassified"),
             BedrockDbKeyKind::Other
         );
+    }
+
+    #[test]
+    fn bedrock_db_key_decodes_non_ascii_template_and_ticking_area_names() {
+        let template = "structuretemplate_mystructure:石头遗迹".as_bytes();
+        assert_eq!(
+            BedrockDbKey::decode(template),
+            BedrockDbKey::StructureTemplate("_mystructure:石头遗迹".to_string())
+        );
+        assert_eq!(
+            BedrockDbKey::StructureTemplate("_mystructure:石头遗迹".to_string())
+                .encode()
+                .as_deref(),
+            Some(template)
+        );
+
+        let ticking = "tickingarea我的区域".as_bytes();
+        assert_eq!(
+            BedrockDbKey::decode(ticking),
+            BedrockDbKey::TickingArea("我的区域".to_string())
+        );
+
+        // Control characters and invalid UTF-8 are still rejected.
+        assert!(matches!(
+            BedrockDbKey::decode(b"structuretemplate_bad\x01name"),
+            BedrockDbKey::Unknown(_)
+        ));
+        assert!(matches!(
+            BedrockDbKey::decode(b"structuretemplate_\xff"),
+            BedrockDbKey::Unknown(_)
+        ));
+        assert!(!matches!(
+            BedrockDbKey::decode(b"structuretemplate"),
+            BedrockDbKey::StructureTemplate(_)
+        ));
     }
 
     #[test]

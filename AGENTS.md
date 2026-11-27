@@ -12,6 +12,7 @@
 |---|---|
 | `from_world_region_blocking` | 每个 subchunk 只解析一次（回读 70 万格 16.1 s → 0.15 s） |
 | `compact_storage_blocking_with` | 压实可指定表块大小与 zlib 级别，转发到后端的 `compact_with` |
+| `utf8_suffix` | `structuretemplate` / `tickingarea` 的键名改用 UTF-8 后缀（拒绝空串与控制字符）；中文模板名不再被归为 `Unknown`。`map_` 仍走 ASCII 校验 |
 
 ## 验证
 

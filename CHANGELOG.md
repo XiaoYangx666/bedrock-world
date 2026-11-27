@@ -2,6 +2,33 @@
 
 All notable changes to `bedrock-world` are tracked here.
 
+## Unreleased
+
+### Added
+
+- `compact_storage_blocking_with` lets callers choose the compaction block size
+  and zlib effort instead of the fixed defaults.
+
+### Changed
+
+- `from_world_region_blocking` decodes each subchunk once (reading 700k blocks:
+  16.1 s → 0.15 s).
+
+### Fixed
+
+- `structuretemplate` and `tickingarea` keys accept any valid UTF-8 suffix
+  without control characters, so template names in non-ASCII scripts decode as
+  `StructureTemplate` / `TickingArea` instead of `Unknown`. `map_` keys keep the
+  ASCII-only rule.
+- `TAG_STRING` payloads that are not valid UTF-8 (for example
+  `internalComponents.EntityStorageKeyComponent.StorageKey`, which holds a raw
+  8-byte key) decode into the new `NbtTag::StringRaw` / `NbtRef::StringRaw` /
+  `NbtEvent::StringRaw` and are written back verbatim.
+- `LevelChunkMetaDataDictionary` decodes with its real layout (an `i32` entry
+  count followed by `u64` CRC64 hashes and NBT compounds) instead of failing as
+  a plain NBT stream. `encode_global_record` returns the stored raw payload for
+  this record because the hashes are not modelled.
+
 ## 0.4.0 - 2026-08-04
 
 ### Added

@@ -13,7 +13,10 @@ use crate::chunk::{
 };
 use crate::error::{BedrockWorldError, Result as WorldResult};
 use crate::level_dat::LevelDatDocument;
-use crate::nbt::{NbtTag, parse_consecutive_root_nbt, parse_root_nbt, serialize_root_nbt};
+use crate::nbt::{
+    NbtTag, parse_consecutive_root_nbt, parse_root_nbt, parse_root_nbt_with_consumed,
+    serialize_root_nbt,
+};
 use crate::storage::{StorageReadOptions, StorageVisitorControl, WorldStorage};
 use bytes::Bytes;
 use indexmap::IndexMap;
@@ -1260,13 +1263,14 @@ fn parse_village_value(
 
 fn parse_global_value(name: &str, value: &Bytes, report: &mut WorldParseReport) -> ParsedDbValue {
     report.global_record_count += 1;
-    match parse_consecutive_root_nbt(value) {
+    let kind = GlobalRecordKind::from_key(name.as_bytes())
+        .unwrap_or_else(|| GlobalRecordKind::Other(name.to_string()));
+    match parse_global_roots(&kind, value) {
         Ok(tags) => {
             report.other_nbt_root_count += tags.len();
             ParsedDbValue::GlobalData(ParsedGlobalData {
                 name: name.to_string(),
-                kind: GlobalRecordKind::from_key(name.as_bytes())
-                    .unwrap_or_else(|| GlobalRecordKind::Other(name.to_string())),
+                kind,
                 roots: tags,
                 raw: value.clone(),
             })
@@ -1303,7 +1307,7 @@ pub fn parse_global_record(
     name: String,
     value: Bytes,
 ) -> WorldResult<ParsedGlobalData> {
-    let roots = parse_consecutive_root_nbt(&value)?;
+    let roots = parse_global_roots(&kind, &value)?;
     Ok(ParsedGlobalData {
         name,
         kind,
@@ -1312,8 +1316,85 @@ pub fn parse_global_record(
     })
 }
 
+/// Decodes the payload of a global record.
+///
+/// `LevelChunkMetaDataDictionary` carries a `u64` hash before every NBT root,
+/// so it cannot go through the plain consecutive-root parser.
+fn parse_global_roots(kind: &GlobalRecordKind, value: &[u8]) -> WorldResult<Vec<NbtTag>> {
+    match kind {
+        GlobalRecordKind::LevelChunkMetaDataDictionary => parse_level_chunk_meta_dictionary(value),
+        _ => parse_consecutive_root_nbt(value),
+    }
+}
+
+/// Parses `LevelChunkMetaDataDictionary`.
+///
+/// Layout: a little-endian `i32` entry count, then that many entries of a
+/// little-endian `u64` CRC64 hash followed by one named NBT compound. The
+/// hashes are not modelled; callers that write this record back get
+/// [`ParsedGlobalData::raw`] unchanged.
+pub fn parse_level_chunk_meta_dictionary(value: &[u8]) -> WorldResult<Vec<NbtTag>> {
+    let count_bytes: [u8; 4] = value
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            BedrockWorldError::CorruptWorld(
+                "chunk metadata dictionary entry count is truncated".to_string(),
+            )
+        })?;
+    let count = usize::try_from(i32::from_le_bytes(count_bytes)).map_err(|_| {
+        BedrockWorldError::CorruptWorld(
+            "chunk metadata dictionary has a negative entry count".to_string(),
+        )
+    })?;
+    if count > value.len() {
+        return Err(BedrockWorldError::CorruptWorld(format!(
+            "chunk metadata dictionary declares {count} entries for {} bytes",
+            value.len()
+        )));
+    }
+
+    let mut roots = Vec::with_capacity(count);
+    let mut cursor = 4usize;
+    for _ in 0..count {
+        let hash: [u8; 8] = value
+            .get(cursor..)
+            .and_then(|rest| rest.get(..8))
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| {
+                BedrockWorldError::CorruptWorld(
+                    "chunk metadata dictionary hash is truncated".to_string(),
+                )
+            })?;
+        let _hash = u64::from_le_bytes(hash);
+        cursor += 8;
+
+        let rest = value.get(cursor..).ok_or_else(|| {
+            BedrockWorldError::CorruptWorld(
+                "chunk metadata dictionary payload is truncated".to_string(),
+            )
+        })?;
+        let (tag, consumed) = parse_root_nbt_with_consumed(rest)?;
+        if consumed == 0 {
+            return Err(BedrockWorldError::CorruptWorld(
+                "chunk metadata dictionary entry did not advance".to_string(),
+            ));
+        }
+        cursor += consumed;
+        roots.push(tag);
+    }
+    Ok(roots)
+}
+
 /// Encode global record.
+///
+/// `LevelChunkMetaDataDictionary` cannot be rebuilt from its roots because the
+/// per-entry CRC64 hashes are not part of the parsed model, so its raw bytes
+/// are returned as stored.
 pub fn encode_global_record(record: &ParsedGlobalData) -> WorldResult<Bytes> {
+    if record.kind == GlobalRecordKind::LevelChunkMetaDataDictionary {
+        return Ok(record.raw.clone());
+    }
     encode_consecutive_roots(&record.roots)
 }
 
@@ -2517,5 +2598,52 @@ mod tests {
         assert_eq!(parsed.report.entry_count, 1);
         assert_eq!(parsed.report.chunk_count, 1);
         assert!(parsed.entries.is_empty());
+    }
+
+    #[test]
+    fn level_chunk_meta_dictionary_parses_hash_prefixed_entries() {
+        let mut first = IndexMap::new();
+        first.insert(
+            "BiomeBaseGameVersion".to_string(),
+            NbtTag::String("1.18.0".to_string()),
+        );
+        let mut second = IndexMap::new();
+        second.insert("GenerationSeed".to_string(), NbtTag::Long(-42));
+
+        let mut value = Vec::new();
+        value.extend_from_slice(&2_i32.to_le_bytes());
+        for (hash, tag) in [
+            (0x002d_c0c9_083a_ad53_u64, NbtTag::Compound(first)),
+            (0x0040_8c3b_7c4a_06c9, NbtTag::Compound(second)),
+        ] {
+            value.extend_from_slice(&hash.to_le_bytes());
+            value.extend_from_slice(&serialize_root_nbt(&tag).expect("serialize"));
+        }
+
+        let roots = parse_level_chunk_meta_dictionary(&value).expect("parse dictionary");
+        assert_eq!(roots.len(), 2);
+
+        let record = parse_global_record(
+            GlobalRecordKind::LevelChunkMetaDataDictionary,
+            "LevelChunkMetaDataDictionary".to_string(),
+            Bytes::from(value.clone()),
+        )
+        .expect("parse record");
+        assert_eq!(record.roots, roots);
+        // Re-encoding keeps the hashes because only the raw payload has them.
+        assert_eq!(
+            encode_global_record(&record).expect("encode"),
+            Bytes::from(value)
+        );
+    }
+
+    #[test]
+    fn level_chunk_meta_dictionary_rejects_truncated_payloads() {
+        assert!(parse_level_chunk_meta_dictionary(&[]).is_err());
+        assert!(parse_level_chunk_meta_dictionary(&(-1_i32).to_le_bytes()).is_err());
+
+        let mut truncated = 1_i32.to_le_bytes().to_vec();
+        truncated.extend_from_slice(&[0; 6]);
+        assert!(parse_level_chunk_meta_dictionary(&truncated).is_err());
     }
 }
